@@ -1,0 +1,24 @@
+numpy
+pandas
+scikit-learn
+matplotlib
+tqdm
+
+# NLP + HF tooling
+datasets>=2.18.0
+transformers>=4.41.0
+accelerate>=0.30.0
+torch
+
+# Retrieval / embeddings
+sentence-transformers>=2.7.0
+rank-bm25>=0.2.2
+
+# Optional quality-of-life
+rich>=13.7.0
+joblib
+
+# Testing (development)
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-timeout>=2.1.0
