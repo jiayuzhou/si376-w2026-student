@@ -128,6 +128,64 @@ Explanation:"""
 # ============================================================
 # LLM-based Explanation
 # ============================================================
+def _extract_prompt_components(prompt: str) -> tuple:
+    """Extract claim, verdict, and evidence from a make_explainer_prompt() output.
+
+    Returns (claim, verdict, evidence_text) tuple, or (None, None, None) if parsing fails.
+    """
+    import re
+
+    claim_match = re.search(r"Claim:\s*(.+?)(?:\n|Verdict)", prompt, re.DOTALL)
+    verdict_match = re.search(r"Verdict:\s*(\w+)", prompt)
+    evidence_match = re.search(r"Evidence bullets:\s*(.+?)(?:\n\nExplanation|\Z)", prompt, re.DOTALL)
+
+    if not (claim_match and verdict_match):
+        return None, None, None
+
+    claim = claim_match.group(1).strip()
+    verdict = verdict_match.group(1).strip()
+
+    evidence_text = ""
+    if evidence_match:
+        evidence_text = evidence_match.group(1).strip()
+        # Remove "- [E1]" style prefixes, keep just the text
+        evidence_text = re.sub(r"-\s*\[E\d+\]\s*", "", evidence_text)
+        evidence_text = evidence_text.replace("\n", " ").strip()
+
+    return claim, verdict, evidence_text
+
+
+def _generate_small_model_explanation(
+    claim: str,
+    verdict: str,
+    evidence_text: str,
+    gen_pipeline
+) -> str:
+    """Generate explanation using a hybrid template + model approach for small models.
+
+    Small models (flan-t5-small, flan-t5-base) struggle with complex instructions.
+    This function uses a hybrid approach:
+    1. Start with a template-based prefix explaining the verdict
+    2. Use the model to summarize/explain the key evidence
+
+    For beginners: Think of this as giving the model an easier task - instead of
+    writing a full explanation, it just needs to summarize what the evidence says.
+    """
+    # Have the model summarize the evidence (a task small models handle well)
+    summary_prompt = f"summarize: {evidence_text}"
+    evidence_summary = gen_pipeline(summary_prompt, max_new_tokens=80, do_sample=False)[0]["generated_text"]
+
+    # Build explanation with template prefix + model-generated evidence summary
+    if verdict == "SUPPORTS":
+        explanation = f"The evidence supports this claim. According to the evidence: {evidence_summary}"
+    elif verdict == "REFUTES":
+        explanation = f"The evidence contradicts this claim. The evidence shows that {evidence_summary}, which conflicts with the claim that \"{claim}\""
+    else:  # NOT ENOUGH INFO
+        explanation = f"The evidence is insufficient to verify this claim. The evidence only states that {evidence_summary}, which does not directly address whether \"{claim}\""
+
+    return explanation
+
+
 def explain_with_flan(
     prompt: str,
     model_name: str = "google/flan-t5-small",
@@ -143,6 +201,10 @@ def explain_with_flan(
     Larger versions (base, large, xl, xxl) are more capable but slower and require
     more memory. The "small" version is fine for classroom use.
 
+    Note: Small models (flan-t5-small, flan-t5-base) have limited instruction-following
+    capabilities. For best results, use flan-t5-large or paste the prompt into ChatGPT.
+    The function automatically simplifies prompts for small models.
+
     Why "offline-friendly"?
     - Model downloads once, then cached locally
     - No API calls to external services (like OpenAI)
@@ -155,9 +217,9 @@ def explain_with_flan(
         Instruction prompt from make_explainer_prompt()
     model_name : str, default="google/flan-t5-small"
         HuggingFace model name. Options:
-        - "google/flan-t5-small" (~250MB, fast)
-        - "google/flan-t5-base" (~900MB, better quality)
-        - "google/flan-t5-large" (~3GB, best quality)
+        - "google/flan-t5-small" (~250MB, fast, limited quality)
+        - "google/flan-t5-base" (~900MB, moderate quality)
+        - "google/flan-t5-large" (~3GB, good quality)
     max_new_tokens : int, default=180
         Maximum number of tokens (words) to generate
         For beginners: Higher = longer explanations but slower. 180 tokens ≈ 3-5 sentences
@@ -185,7 +247,17 @@ def explain_with_flan(
     # - model=model_name: Which model to use (downloads first time, then cached)
     gen = pipeline("text2text-generation", model=model_name)
 
-    # Generate explanation
+    # For small models, use hybrid template + summarization approach
+    # For beginners: Small models can't follow complex instructions well,
+    # so we use a simpler approach: template prefix + model-generated summary
+    if "small" in model_name or "base" in model_name:
+        claim, verdict, evidence_text = _extract_prompt_components(prompt)
+        if claim and verdict:
+            out = _generate_small_model_explanation(claim, verdict, evidence_text, gen)
+            return Explanation(text=out, model_name=model_name)
+        # Fall through to standard generation if parsing fails
+
+    # Generate explanation using the full prompt (for larger models)
     # For beginners: gen(prompt, ...) runs the model with these settings:
     # - prompt: The input instruction
     # - max_new_tokens: Stop after generating this many tokens
