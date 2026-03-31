@@ -33,7 +33,26 @@ For beginners: Think of an agent like a detective following a process:
 2. Check if evidence supports or contradicts the claim (NLI)
 3. Write a report explaining the verdict (LLM/template)
 
+LLM-Based Agent Architecture (Week 13):
+
+The **LLMFactCheckAgent** uses a language model (FLAN-T5) as its "brain" to decide
+which tool to call next. Instead of hardcoded if/else logic, the LLM reads the
+current state and outputs a decision. This is the closest to a "real" agent:
+- Scripted agent: fixed pipeline (no decisions)
+- Adaptive agent: rule-based decisions (threshold checks)
+- LLM agent: model-based decisions (LLM reads state and chooses)
+
 Used in Weeks 13-14 for single-agent and multi-agent fact-checking systems.
+
+Adaptive Agent Architecture (Week 13):
+
+The **AdaptiveFactCheckAgent** extends the scripted agent with genuine decision-making:
+1. **Retrieval Quality Check**: If top retrieval score is too low, tries a fallback retriever
+2. **NLI Confidence Check**: If all NLI predictions are neutral/low-confidence, abstains
+3. **Conflict Detection**: If evidence both supports AND contradicts, flags uncertainty
+
+These decisions appear as "decide" steps in the tool trace, making the ReAct loop
+tangible — the agent truly reasons about its observations before proceeding.
 """
 
 from __future__ import annotations
@@ -42,7 +61,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Tuple
 
 from .llm import explain
-from .nli import aggregate_verdict_from_nli, nli_predict
+from .nli import NLIPrediction, aggregate_verdict_from_nli, nli_predict
 
 
 # ============================================================
@@ -306,3 +325,487 @@ class FactCheckAgent:
             explanation=expl.text,    # Generated explanation
             trace=trace               # Step-by-step trace of what agent did
         )
+
+
+# ============================================================
+# Adaptive Fact-Checking Agent
+# ============================================================
+class AdaptiveFactCheckAgent(FactCheckAgent):
+    """A fact-checking agent that adapts based on observations.
+
+    Unlike FactCheckAgent (which always follows retrieve -> verify -> explain),
+    this agent makes genuine decisions at runtime:
+
+    1. **Retrieval Quality Check + Fallback**: After retrieving evidence, checks if
+       the top retrieval score is below a threshold. If so, tries a different
+       retriever (e.g., TF-IDF fails -> try BM25).
+
+    2. **NLI Confidence Check + Abstention**: After NLI verification, if all
+       predictions are neutral/low-confidence, the agent abstains rather than
+       making a guess.
+
+    3. **Conflict Detection**: If NLI returns both ENTAILMENT and CONTRADICTION
+       across evidence pieces, flags the conflict in the trace.
+
+    This is a real ReAct agent: the trace includes "decide" steps that show the
+    agent's reasoning, not just tool calls.
+
+    For beginners: The scripted agent (FactCheckAgent) is like following a recipe
+    step by step no matter what. The adaptive agent is like a chef who tastes the
+    food at each step and adjusts — if the evidence is bad, try another source;
+    if nothing is clear, say "I'm not sure" instead of guessing.
+
+    Attributes
+    ----------
+    retrievers : List[Tuple[str, Callable]]
+        List of (name, retriever_fn) tuples to try in order.
+        For example: [("tfidf", tfidf_fn), ("bm25", bm25_fn)]
+    retrieval_threshold : float
+        Minimum top retrieval score to proceed without fallback.
+    abstention_threshold : float
+        Maximum NLI confidence below which the agent abstains.
+    """
+
+    def __init__(
+        self,
+        retrievers: List[Tuple[str, Callable[[str, int], List[Tuple[str, float, str]]]]],
+        tokenizer: Any,
+        nli_model: Any,
+        retrieval_threshold: float = 0.15,
+        abstention_threshold: float = 0.6
+    ):
+        """Initialize adaptive fact-checking agent with multiple retrievers.
+
+        Parameters
+        ----------
+        retrievers : List[Tuple[str, Callable]]
+            Ordered list of (name, retriever_function) tuples.
+            The agent tries each in order until retrieval quality is acceptable.
+            For example: [("tfidf", tfidf_fn), ("bm25", bm25_fn)]
+        tokenizer : Any
+            HuggingFace tokenizer for NLI model
+        nli_model : Any
+            HuggingFace NLI model
+        retrieval_threshold : float, default=0.15
+            If top retrieval score is below this, try the next retriever.
+        abstention_threshold : float, default=0.6
+            If max NLI confidence is below this AND all predictions are neutral,
+            the agent abstains instead of generating an explanation.
+        """
+        # Initialize parent with the first retriever
+        super().__init__(retrievers[0][1], tokenizer, nli_model)
+        self.retrievers = retrievers
+        self.retrieval_threshold = retrieval_threshold
+        self.abstention_threshold = abstention_threshold
+
+    def run(
+        self,
+        claim: str,
+        top_k: int = 5,
+        use_llm: bool = True
+    ) -> FactCheckResult:
+        """Run the adaptive fact-checking pipeline on a claim.
+
+        Unlike the scripted agent, this method makes decisions based on
+        observations at each stage. The trace includes "decide" steps
+        that show the agent's reasoning.
+
+        Pipeline with decision points:
+        1. **Retrieve** with quality check (may retry with fallback)
+        2. **Verify** with NLI
+        3. **Decide**: Check for abstention or conflict
+        4. **Explain** (only if confident enough)
+
+        Parameters
+        ----------
+        claim : str
+            Claim to verify
+        top_k : int, default=5
+            How many evidence sentences to retrieve
+        use_llm : bool, default=True
+            Whether to use LLM for explanation
+
+        Returns
+        -------
+        FactCheckResult
+            Complete result including verdict, evidence, explanation, and trace.
+            Trace includes "decide" steps showing agent reasoning.
+        """
+        trace: List[ToolTraceStep] = []
+
+        # ====== STAGE 1: Retrieve with Quality Check + Fallback ======
+        retrieved = []
+        retriever_used = self.retrievers[0][0]
+
+        for i, (name, retriever_fn) in enumerate(self.retrievers):
+            retrieved = retriever_fn(claim, top_k=top_k)
+            top_score = retrieved[0][1] if retrieved else 0.0
+
+            trace.append(ToolTraceStep(
+                tool="retrieve",
+                input=f"claim={claim} top_k={top_k} retriever={name}",
+                output_summary=f"retrieved {len(retrieved)} sentences, top_score={top_score:.3f}"
+            ))
+
+            if top_score >= self.retrieval_threshold:
+                retriever_used = name
+                break  # Good enough — proceed
+            elif i + 1 < len(self.retrievers):
+                next_name = self.retrievers[i + 1][0]
+                trace.append(ToolTraceStep(
+                    tool="decide",
+                    input=f"top_score={top_score:.3f}, threshold={self.retrieval_threshold}",
+                    output_summary=f"RETRY: score {top_score:.3f} < {self.retrieval_threshold}, trying {next_name}"
+                ))
+            else:
+                # Last retriever — proceed with what we have
+                retriever_used = name
+                trace.append(ToolTraceStep(
+                    tool="decide",
+                    input=f"top_score={top_score:.3f}, threshold={self.retrieval_threshold}",
+                    output_summary=f"PROCEED: score {top_score:.3f} < {self.retrieval_threshold}, no more retrievers"
+                ))
+
+        # ====== STAGE 2: Verify with NLI ======
+        nli_preds: List[NLIPrediction] = []
+        for key, score, sent in retrieved:
+            p = nli_predict(
+                premise=sent,
+                hypothesis=claim,
+                tokenizer=self.tokenizer,
+                model=self.nli_model
+            )
+            nli_preds.append(p)
+
+        verdict = aggregate_verdict_from_nli(nli_preds)
+
+        trace.append(ToolTraceStep(
+            tool="verify_nli",
+            input=f"{len(retrieved)} candidates",
+            output_summary=f"verdict={verdict}"
+        ))
+
+        # ====== STAGE 2.5: Decision — Check for Abstention and Conflict ======
+
+        # Conflict detection: both ENTAILMENT and CONTRADICTION present
+        has_entail = any(
+            p.probs.get("ENTAILMENT", 0.0) >= 0.5 for p in nli_preds
+        )
+        has_contra = any(
+            p.probs.get("CONTRADICTION", 0.0) >= 0.5 for p in nli_preds
+        )
+
+        if has_entail and has_contra:
+            n_entail = sum(1 for p in nli_preds if p.probs.get("ENTAILMENT", 0.0) >= 0.5)
+            n_contra = sum(1 for p in nli_preds if p.probs.get("CONTRADICTION", 0.0) >= 0.5)
+            trace.append(ToolTraceStep(
+                tool="decide",
+                input=f"entailments={n_entail}, contradictions={n_contra}",
+                output_summary=f"CONFLICT: {n_entail} entail, {n_contra} contradict"
+            ))
+
+        # Abstention check: all neutral AND low confidence
+        all_neutral = all(p.label in ("NEUTRAL", "NOT ENOUGH INFO") for p in nli_preds)
+        max_conf = max(
+            (max(p.probs.get("ENTAILMENT", 0.0), p.probs.get("CONTRADICTION", 0.0))
+             for p in nli_preds),
+            default=0.0
+        )
+
+        if all_neutral and max_conf < self.abstention_threshold:
+            trace.append(ToolTraceStep(
+                tool="decide",
+                input=f"all_neutral={all_neutral}, max_conf={max_conf:.3f}, threshold={self.abstention_threshold}",
+                output_summary=f"ABSTAIN: all NLI neutral, max_conf {max_conf:.3f} < {self.abstention_threshold}"
+            ))
+            return FactCheckResult(
+                claim=claim,
+                verdict="NOT ENOUGH INFO",
+                evidence=retrieved,
+                explanation="Agent abstained: evidence not relevant or confident enough to make a determination.",
+                trace=trace
+            )
+
+        # ====== STAGE 3: Explain (only reached if confident enough) ======
+        evidence_texts = [t for (_, _, t) in retrieved[:3]]
+        expl = explain(claim, verdict, evidence_texts, use_llm=use_llm)
+
+        trace.append(ToolTraceStep(
+            tool="explain",
+            input="top3 evidence",
+            output_summary=f"model={expl.model_name}"
+        ))
+
+        return FactCheckResult(
+            claim=claim,
+            verdict=verdict,
+            evidence=retrieved,
+            explanation=expl.text,
+            trace=trace
+        )
+
+
+# ============================================================
+# LLM-Based Fact-Checking Agent
+# ============================================================
+class LLMFactCheckAgent(FactCheckAgent):
+    """A fact-checking agent that uses an LLM to decide what to do next.
+
+    Unlike the scripted agent (fixed pipeline) or adaptive agent (rule-based
+    decisions), this agent uses FLAN-T5 as its "brain" — the LLM reads the
+    current situation and decides which tool to call.
+
+    This is the closest to a "real" agent:
+    - Scripted: always retrieve → verify → explain (no decisions)
+    - Adaptive: if score < threshold → retry (hardcoded rules)
+    - LLM-based: "Given this evidence quality, what should I do?" (model decides)
+
+    For beginners: Think of the three agents as:
+    - Scripted = following a recipe exactly
+    - Adaptive = following a recipe but checking food temperature
+    - LLM-based = a chef who reads the situation and improvises
+
+    The LLM agent sometimes makes brilliant decisions and sometimes makes
+    mistakes — that's the key teaching moment! Real LLM agents (like Claude
+    Code) use much larger models, but the pattern is identical.
+
+    Attributes
+    ----------
+    planner : pipeline
+        FLAN-T5 text generation pipeline used for planning decisions
+    max_steps : int
+        Maximum number of steps to prevent infinite loops
+    """
+
+    def __init__(
+        self,
+        retriever: Callable[[str, int], List[Tuple[str, float, str]]],
+        tokenizer: Any,
+        nli_model: Any,
+        planner_model: str = "google/flan-t5-small",
+        max_steps: int = 8
+    ):
+        """Initialize LLM-based fact-checking agent.
+
+        Parameters
+        ----------
+        retriever : Callable
+            Retrieval function
+        tokenizer, nli_model : Any
+            NLI model components
+        planner_model : str
+            HuggingFace model for planning decisions (default: flan-t5-small)
+        max_steps : int
+            Maximum steps to prevent infinite loops
+        """
+        super().__init__(retriever, tokenizer, nli_model)
+        self.max_steps = max_steps
+
+        # Load the planner LLM (seq2seq model like FLAN-T5)
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer as AutoTok
+        self.planner_tokenizer = AutoTok.from_pretrained(planner_model)
+        self.planner_model_obj = AutoModelForSeq2SeqLM.from_pretrained(planner_model)
+        self.planner_model = planner_model
+
+    def _ask_planner(self, prompt: str) -> str:
+        """Ask the LLM planner what to do next.
+
+        Parameters
+        ----------
+        prompt : str
+            Description of current state and available actions
+
+        Returns
+        -------
+        str
+            The LLM's decision (parsed to extract action)
+        """
+        import torch
+        inputs = self.planner_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = self.planner_model_obj.generate(**inputs, max_new_tokens=30, do_sample=False)
+        result = self.planner_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return result.strip()
+
+    def run(
+        self,
+        claim: str,
+        top_k: int = 1,
+        use_llm: bool = True
+    ) -> FactCheckResult:
+        """Run the LLM-based agent on a claim.
+
+        The agent follows a ReAct loop:
+        1. Ask LLM: "What should I do next?"
+        2. Execute the chosen tool
+        3. Observe the result
+        4. Repeat until LLM says "done" or max_steps reached
+
+        Parameters
+        ----------
+        claim : str
+            Claim to fact-check
+        top_k : int
+            Number of evidence sentences to retrieve
+        use_llm : bool
+            Whether to use LLM for final explanation
+
+        Returns
+        -------
+        FactCheckResult
+            Complete result with verdict, evidence, explanation, and trace
+        """
+        trace: List[ToolTraceStep] = []
+        retrieved = []
+        nli_preds = []
+        verdict = None
+
+        for step_num in range(self.max_steps):
+            # Build the planning prompt based on current state
+            prompt = self._build_planning_prompt(claim, step_num, retrieved, nli_preds, verdict)
+
+            # Ask the LLM what to do
+            decision = self._ask_planner(prompt)
+
+            # Record the planning step
+            trace.append(ToolTraceStep(
+                tool="plan",
+                input=f"step={step_num}, state={'has evidence' if retrieved else 'no evidence'}, verdict={verdict}",
+                output_summary=f"LLM decided: {decision[:60]}"
+            ))
+
+            # Parse and execute the decision
+            action = self._parse_action(decision, retrieved, verdict)
+
+            if action == "retrieve":
+                retrieved = self.retriever(claim, top_k=top_k)
+                trace.append(ToolTraceStep(
+                    tool="retrieve",
+                    input=f"claim={claim[:40]}... top_k={top_k}",
+                    output_summary=f"retrieved {len(retrieved)} sentences"
+                ))
+
+            elif action == "verify":
+                if not retrieved:
+                    # LLM tried to verify without evidence — record the mistake
+                    trace.append(ToolTraceStep(
+                        tool="decide",
+                        input="LLM chose verify but no evidence available",
+                        output_summary="ERROR: no evidence to verify — will retrieve first"
+                    ))
+                    retrieved = self.retriever(claim, top_k=top_k)
+                    trace.append(ToolTraceStep(
+                        tool="retrieve",
+                        input=f"claim={claim[:40]}... top_k={top_k}",
+                        output_summary=f"retrieved {len(retrieved)} sentences (recovery)"
+                    ))
+
+                nli_preds = []
+                for key, score, sent in retrieved:
+                    p = nli_predict(
+                        premise=sent,
+                        hypothesis=claim,
+                        tokenizer=self.tokenizer,
+                        model=self.nli_model
+                    )
+                    nli_preds.append(p)
+                verdict = aggregate_verdict_from_nli(nli_preds)
+                trace.append(ToolTraceStep(
+                    tool="verify_nli",
+                    input=f"{len(retrieved)} candidates",
+                    output_summary=f"verdict={verdict}"
+                ))
+
+            elif action == "explain":
+                evidence_texts = [t for (_, _, t) in retrieved[:3]]
+                expl = explain(claim, verdict or "NOT ENOUGH INFO", evidence_texts, use_llm=use_llm)
+                trace.append(ToolTraceStep(
+                    tool="explain",
+                    input="top3 evidence",
+                    output_summary=f"model={expl.model_name}"
+                ))
+                # Done!
+                return FactCheckResult(
+                    claim=claim,
+                    verdict=verdict or "NOT ENOUGH INFO",
+                    evidence=retrieved,
+                    explanation=expl.text,
+                    trace=trace
+                )
+
+            elif action == "done" or action == "abstain":
+                trace.append(ToolTraceStep(
+                    tool="decide",
+                    input=f"LLM said: {decision[:40]}",
+                    output_summary=f"LLM chose to stop: {action}"
+                ))
+                break
+
+        # If we hit max_steps or broke out, generate final result
+        if verdict is None and retrieved:
+            nli_preds = []
+            for key, score, sent in retrieved:
+                p = nli_predict(premise=sent, hypothesis=claim,
+                                tokenizer=self.tokenizer, model=self.nli_model)
+                nli_preds.append(p)
+            verdict = aggregate_verdict_from_nli(nli_preds)
+
+        evidence_texts = [t for (_, _, t) in retrieved[:3]] if retrieved else []
+        expl = explain(claim, verdict or "NOT ENOUGH INFO", evidence_texts, use_llm=use_llm)
+
+        return FactCheckResult(
+            claim=claim,
+            verdict=verdict or "NOT ENOUGH INFO",
+            evidence=retrieved,
+            explanation=expl.text,
+            trace=trace
+        )
+
+    def _build_planning_prompt(self, claim, step_num, retrieved, nli_preds, verdict):
+        """Build a prompt for the LLM planner.
+
+        For beginners: This is the "Reason" step of ReAct. We describe the
+        current state to the LLM and ask it what to do next.
+        """
+        if step_num == 0:
+            return (
+                f"You are a fact-checking agent. You need to verify this claim: \"{claim}\"\n"
+                f"Available tools: retrieve (find evidence), verify (check with NLI), explain (write explanation).\n"
+                f"What should you do first? Answer with one word: retrieve, verify, or explain."
+            )
+
+        if retrieved and verdict is None:
+            return (
+                f"I have evidence for the claim \"{claim[:50]}\". "
+                f"I have not verified it yet. "
+                f"Should I verify or explain? Answer with one word."
+            )
+
+        if retrieved and verdict is not None:
+            return (
+                f"I verified the claim \"{claim[:50]}\" and the verdict is {verdict}. "
+                f"The next step is to explain the verdict. "
+                f"What should I do? Answer with one word: explain or done."
+            )
+
+    def _parse_action(self, decision, retrieved, verdict):
+        """Parse the LLM's decision into an action.
+
+        For beginners: The LLM outputs free text, so we need to extract
+        the action. Small models sometimes output unexpected text —
+        that's why we have fallback logic.
+        """
+        decision_lower = decision.lower().strip()
+
+        # Direct match
+        for action in ["retrieve", "verify", "explain", "done", "abstain"]:
+            if action in decision_lower:
+                return action
+
+        # Fallback: if LLM output is unclear, use heuristics
+        if not retrieved:
+            return "retrieve"
+        elif verdict is None:
+            return "verify"
+        else:
+            return "explain"
